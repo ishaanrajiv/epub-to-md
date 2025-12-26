@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use epub::doc::EpubDoc;
 use rayon::prelude::*;
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -18,6 +19,49 @@ struct Cli {
 
     #[arg(short, long, help = "Create a single merged Markdown file instead of separate files")]
     single: bool,
+}
+
+/// Metadata extracted from an EPUB file
+#[derive(Debug, Serialize)]
+struct BookMetadata {
+    /// Book title
+    title: Option<String>,
+    /// Book author(s)
+    creators: Vec<String>,
+    /// Book language
+    language: Option<String>,
+    /// Book description/summary
+    description: Option<String>,
+    /// Publisher
+    publisher: Option<String>,
+    /// Publication date
+    date: Option<String>,
+    /// Book subjects/categories
+    subjects: Vec<String>,
+    /// Unique identifier (ISBN, UUID, etc.)
+    identifier: Option<String>,
+    /// Rights/copyright information
+    rights: Option<String>,
+    /// Contributors (editors, illustrators, etc.)
+    contributors: Vec<String>,
+    /// Source of the book
+    source: Option<String>,
+    /// EPUB format version
+    epub_version: String,
+    /// Release identifier
+    release_identifier: Option<String>,
+    /// Number of chapters in spine
+    chapter_count: usize,
+    /// Table of contents entries
+    toc: Vec<TocEntry>,
+}
+
+/// Table of contents entry
+#[derive(Debug, Serialize)]
+struct TocEntry {
+    label: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<TocEntry>,
 }
 
 fn main() -> Result<()> {
@@ -126,23 +170,76 @@ fn process_single_epub(epub_path: &Path, output_base: Option<&Path>, single_file
     Ok(())
 }
 
+/// Extract all metadata from an EPUB document
+fn extract_metadata<R: std::io::Read + std::io::Seek>(doc: &EpubDoc<R>) -> BookMetadata {
+    // Helper to get all metadata values for a given property
+    let get_all_values = |property: &str| -> Vec<String> {
+        doc.metadata
+            .iter()
+            .filter(|m| m.property == property)
+            .map(|m| m.value.clone())
+            .collect()
+    };
+
+    // Get single metadata value
+    let get_value = |property: &str| -> Option<String> {
+        doc.mdata(property).map(|m| m.value.clone())
+    };
+
+    // Convert TOC NavPoints to TocEntry
+    fn convert_toc(nav_points: &[epub::doc::NavPoint]) -> Vec<TocEntry> {
+        nav_points
+            .iter()
+            .map(|np| TocEntry {
+                label: np.label.clone(),
+                children: convert_toc(&np.children),
+            })
+            .collect()
+    }
+
+    // Get EPUB version as string
+    let epub_version = format!("{:?}", doc.version);
+
+    BookMetadata {
+        title: get_value("title"),
+        creators: get_all_values("creator"),
+        language: get_value("language"),
+        description: get_value("description"),
+        publisher: get_value("publisher"),
+        date: get_value("date"),
+        subjects: get_all_values("subject"),
+        identifier: get_value("identifier"),
+        rights: get_value("rights"),
+        contributors: get_all_values("contributor"),
+        source: get_value("source"),
+        epub_version,
+        release_identifier: doc.get_release_identifier(),
+        chapter_count: doc.spine.len(),
+        toc: convert_toc(&doc.toc),
+    }
+}
+
 fn convert_epub_to_markdown(epub_path: &Path, output_dir: &Path, single_file: bool) -> Result<()> {
     // Open the EPUB document
     let mut doc = EpubDoc::new(epub_path)
         .context("Failed to open EPUB file")?;
 
-    // Create output directory if it doesn't exist
-    if !single_file {
-        fs::create_dir_all(output_dir)
-            .context("Failed to create output directory")?;
-    }
+    // Create output directory
+    fs::create_dir_all(output_dir)
+        .context("Failed to create output directory")?;
 
-    // Get book metadata
-    let title = doc.mdata("title")
-        .map(|m| m.value.clone())
-        .unwrap_or_else(|| "Unknown Title".to_string());
-    let author = doc.mdata("creator")
-        .map(|m| m.value.clone())
+    // Extract and save metadata
+    let metadata = extract_metadata(&doc);
+    let metadata_path = output_dir.join("metadata.json");
+    let metadata_json = serde_json::to_string_pretty(&metadata)
+        .context("Failed to serialize metadata")?;
+    fs::write(&metadata_path, &metadata_json)
+        .context("Failed to write metadata.json")?;
+
+    // Get book metadata for display
+    let title = metadata.title.clone().unwrap_or_else(|| "Unknown Title".to_string());
+    let author = metadata.creators.first()
+        .cloned()
         .unwrap_or_else(|| "Unknown Author".to_string());
 
     println!("  [{}] Title: {}, Author: {}", 
@@ -196,9 +293,7 @@ fn convert_epub_to_markdown(epub_path: &Path, output_dir: &Path, single_file: bo
     // Write single combined file if requested
     if single_file {
         let filename = format!("{}.md", sanitize_filename(&title));
-        let filepath = output_dir.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(&filename);
+        let filepath = output_dir.join(&filename);
 
         fs::write(&filepath, all_content)
             .context("Failed to write combined Markdown file")?;
